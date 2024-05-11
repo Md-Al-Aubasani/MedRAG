@@ -7,6 +7,7 @@ import time
 import argparse
 import transformers
 from transformers import AutoTokenizer
+from transformers import TextStreamer
 import openai
 from transformers import StoppingCriteria, StoppingCriteriaList
 import tiktoken
@@ -14,18 +15,19 @@ import sys
 sys.path.append("src")
 from utils import RetrievalSystem
 from template import *
+from mistral_model import get_mistral
 
 if openai.api_key is None:
     from config import config
     openai.api_type = config["api_type"]
-    openai.api_base = config["api_base"] 
+    openai.api_base = config["api_base"]
     openai.api_version = config["api_version"]
     openai.api_key = config["api_key"]
 
 
 class MedRAG:
 
-    def __init__(self, llm_name="OpenAI/gpt-3.5-turbo-16k", rag=True, retriever_name="MedCPT", corpus_name="Textbooks", db_dir="./corpus", cache_dir=None):
+    def __init__(self, llm_name="OpenAI/gpt-3.5-turbo-16k", rag=True, retriever_name="RRF-4", corpus_name="MedCorp", db_dir="./corpus", cache_dir=None):
         self.llm_name = llm_name
         self.rag = rag
         self.retriever_name = retriever_name
@@ -68,7 +70,8 @@ class MedRAG:
             self.max_length = 2048
             self.context_length = 1024
             self.tokenizer = AutoTokenizer.from_pretrained(self.llm_name, cache_dir=self.cache_dir)
-            if "mixtral" in llm_name.lower():
+            if "mistral" in llm_name.lower():
+                #TODO:
                 self.tokenizer.chat_template = open('./templates/mistral-instruct.jinja').read().replace('    ', '').replace('\n', '')
                 self.max_length = 32768
                 self.context_length = 30000
@@ -88,7 +91,11 @@ class MedRAG:
                 self.tokenizer.chat_template = open('./templates/pmc_llama.jinja').read().replace('    ', '').replace('\n', '')
                 self.max_length = 2048
                 self.context_length = 1024
-            self.model = transformers.pipeline(
+            
+            if "mistral" in llm_name.lower():
+                self.model = get_mistral()
+            else:
+                self.model = transformers.pipeline(
                 "text-generation",
                 model=self.llm_name,
                 # torch_dtype=torch.float16,
@@ -149,15 +156,15 @@ class MedRAG:
                 ]
                 ans = self.generate(messages)
                 answers.append(re.sub("\s+", " ", ans))
-        
+
         if save_dir is not None:
             with open(os.path.join(save_dir, "snippets.json"), 'w') as f:
                 json.dump(retrieved_snippets, f, indent=4)
             with open(os.path.join(save_dir, "response.json"), 'w') as f:
                 json.dump(answers, f, indent=4)
-        
+
         return answers[0] if len(answers)==1 else answers, retrieved_snippets, scores
-            
+
     def custom_stop(self, stop_str, input_len=0):
         stopping_criteria = StoppingCriteriaList([CustomStoppingCriteria(stop_str, self.tokenizer, input_len)])
         return stopping_criteria
@@ -184,12 +191,68 @@ class MedRAG:
             response = self.model.generate_content(messages[0]["content"] + '\n\n' + messages[1]["content"])
             ans = response.candidates[0].content.parts[0].text
         else:
+          #############################################
+          # streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+          # past_key_values = None
+          # sequence = None
+
+          # seq_len = 0
+          # while True:
+          #   print("User: ", end="")
+          #   user_input = input()
+          #   print("\n")
+
+          #   user_entry = dict(role="user", content=user_input)
+          #   input_ids = tokenizer.apply_chat_template([user_entry], return_tensors="pt").to(device)
+
+          #   if past_key_values is None:
+          #     attention_mask = torch.ones_like(input_ids)
+          #   else:
+          #     seq_len = input_ids.size(1) + past_key_values[0][0][0].size(1)
+          #     attention_mask = torch.ones([1, seq_len - 1], dtype=torch.int, device=device)
+          ##############################################
+
             stopping_criteria = None
             prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            if "meditron" in self.llm_name.lower():
+
+            if "mistral" in self.llm_name.lower():
+                device = torch.device("cuda:0")
+                input_ids = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, return_tensors="pt").to(device)
+
+                streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+                past_key_values = None
+                sequence = None
+
+                seq_len = 0
+
+                if past_key_values is None:
+                  attention_mask = torch.ones_like(input_ids)
+                else:
+                  seq_len = input_ids.size(1) + past_key_values[0][0][0].size(1)
+                  attention_mask = torch.ones([1, seq_len - 1], dtype=torch.int, device=device)
+
+                response = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                streamer=streamer,
+                do_sample=True,
+                temperature=0.9,
+                top_p=0.9,
+                max_new_tokens=512,
+                pad_token_id=self.tokenizer.eos_token_id,
+                return_dict_in_generate=True,
+                output_hidden_states=True,
+                stopping_criteria=stopping_criteria
+                )
+
+                sequence = response["sequences"]
+                past_key_values = response["past_key_values"]
+
+            elif "meditron" in self.llm_name.lower():
                 # stopping_criteria = custom_stop(["###", "User:", "\n\n\n"], self.tokenizer, input_len=len(self.tokenizer.encode(prompt_cot, add_special_tokens=True)))
                 stopping_criteria = self.custom_stop(["###", "User:", "\n\n\n"], input_len=len(self.tokenizer.encode(prompt, add_special_tokens=True)))
-            if "llama-3" in self.llm_name.lower():
+            elif "llama-3" in self.llm_name.lower():
                 response = self.model(
                     prompt,
                     do_sample=False,
